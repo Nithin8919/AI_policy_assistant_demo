@@ -1,324 +1,213 @@
 """
-Policy Retriever for RAG system
+Weaviate Retriever for AP Policy Co-Pilot
+Hybrid search combining vector similarity and keyword filtering
 """
-import psycopg2
-import psycopg2.extras
-from typing import List, Dict, Any, Optional
-import logging
-import numpy as np
-from sentence_transformers import SentenceTransformer
 import os
-from pathlib import Path
+import logging
+from typing import List, Dict, Any, Optional
+import weaviate
+from weaviate.classes.query import MetadataQuery, Filter
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
-class PolicyRetriever:
-    """Retrieves relevant policy documents using vector similarity"""
+class WeaviateRetriever:
+    """Hybrid retriever using Weaviate"""
     
-    def __init__(self, db_config: Optional[Dict[str, str]] = None):
-        self.db_config = db_config or {
-            'host': os.getenv('POSTGRES_HOST', 'localhost'),
-            'port': os.getenv('POSTGRES_PORT', '5432'),
-            'database': os.getenv('POSTGRES_DB', 'policy'),
-            'user': os.getenv('POSTGRES_USER', 'postgres'),
-            'password': os.getenv('POSTGRES_PASSWORD', '1234')
-        }
+    def __init__(self):
+        # Connect to Weaviate
+        weaviate_url = os.getenv('WEAVIATE_URL', 'http://localhost:8080')
+        self.client = weaviate.connect_to_local(
+            host=weaviate_url.replace('http://', '').replace('https://', ''),
+            port=8080,
+            grpc_port=50051
+        )
         
-        # Initialize embedding model
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        # Embedding model
+        model_name = os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
+        self.embedding_model = SentenceTransformer(model_name)
         
-        # Test database connection
-        self._test_connection()
+        logger.info("Initialized Weaviate retriever")
     
-    def _test_connection(self):
-        """Test database connection"""
-        try:
-            conn = psycopg2.connect(**self.db_config)
-            conn.close()
-            logger.info("Database connection successful")
-        except Exception as e:
-            logger.error(f"Database connection failed: {e}")
-            raise
+    def generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding for query"""
+        embedding = self.embedding_model.encode(text, convert_to_tensor=False)
+        return embedding.tolist()
     
-    def retrieve(
+    def search(
         self,
-        query_embedding: List[float],
-        max_results: int = 5,
-        include_vector: bool = True,
-        similarity_threshold: float = 0.7
+        query: str,
+        limit: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+        alpha: float = 0.7  # 0.7 = 70% vector, 30% keyword
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve relevant policy documents using vector similarity
+        Hybrid search combining vector similarity and keyword search
         
         Args:
-            query_embedding: Query embedding vector
-            max_results: Maximum number of results to return
-            include_vector: Whether to include vector similarity scores
-            similarity_threshold: Minimum similarity threshold
-            
-        Returns:
-            List of relevant document chunks with metadata
+            query: Search query
+            limit: Maximum results
+            filters: Property filters (indicator, district, year, etc.)
+            alpha: Balance between vector (1.0) and keyword (0.0) search
         """
         try:
-            conn = psycopg2.connect(**self.db_config)
-            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            fact_collection = self.client.collections.get("Fact")
             
-            # Convert embedding to PostgreSQL vector format
-            embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
+            # Generate query embedding
+            query_vector = self.generate_embedding(query)
             
-            # Query for similar spans using cosine similarity
-            query = """
-            SELECT 
-                bt.bridge_id,
-                bt.doc_id,
-                bt.span_text,
-                bt.span_start,
-                bt.span_end,
-                bt.entity_id,
-                bt.relation_id,
-                bt.confidence,
-                bt.source_url,
-                bt.created_at,
-                1 - (bt.embedding <=> %s::vector) as similarity_score
-            FROM bridge_table bt
-            WHERE 1 - (bt.embedding <=> %s::vector) > %s
-            ORDER BY bt.embedding <=> %s::vector
-            LIMIT %s;
-            """
+            # Build filter if provided
+            filter_obj = None
+            if filters:
+                filter_conditions = []
+                
+                if 'indicator' in filters:
+                    filter_conditions.append(
+                        Filter.by_property("indicator").equal(filters['indicator'])
+                    )
+                
+                if 'district' in filters:
+                    filter_conditions.append(
+                        Filter.by_property("district").equal(filters['district'])
+                    )
+                
+                if 'year' in filters:
+                    filter_conditions.append(
+                        Filter.by_property("year").equal(filters['year'])
+                    )
+                
+                if 'category' in filters:
+                    filter_conditions.append(
+                        Filter.by_property("category").equal(filters['category'])
+                    )
+                
+                # Combine filters with AND
+                if filter_conditions:
+                    filter_obj = filter_conditions[0]
+                    for condition in filter_conditions[1:]:
+                        filter_obj = filter_obj & condition
             
-            cursor.execute(query, (embedding_str, embedding_str, similarity_threshold, embedding_str, max_results))
-            results = cursor.fetchall()
+            # Hybrid search
+            response = fact_collection.query.hybrid(
+                query=query,
+                vector=query_vector,
+                alpha=alpha,
+                limit=limit,
+                filters=filter_obj,
+                return_metadata=MetadataQuery(distance=True, score=True)
+            )
             
-            # Convert to list of dictionaries
-            retrieved_docs = []
-            for row in results:
-                doc = dict(row)
-                if not include_vector:
-                    doc.pop('similarity_score', None)
-                retrieved_docs.append(doc)
+            # Format results
+            results = []
+            for obj in response.objects:
+                result = {
+                    'fact_id': obj.properties.get('fact_id'),
+                    'indicator': obj.properties.get('indicator'),
+                    'category': obj.properties.get('category'),
+                    'district': obj.properties.get('district'),
+                    'year': obj.properties.get('year'),
+                    'value': obj.properties.get('value'),
+                    'unit': obj.properties.get('unit'),
+                    'source': obj.properties.get('source'),
+                    'page_ref': obj.properties.get('page_ref'),
+                    'confidence': obj.properties.get('confidence'),
+                    'span_text': obj.properties.get('span_text'),
+                    'pdf_name': obj.properties.get('pdf_name'),
+                    'score': obj.metadata.score if obj.metadata else None,
+                    'distance': obj.metadata.distance if obj.metadata else None
+                }
+                results.append(result)
             
-            conn.close()
-            
-            logger.info(f"Retrieved {len(retrieved_docs)} relevant documents")
-            return retrieved_docs
-            
+            logger.info(f"Found {len(results)} results for query: {query}")
+            return results
+        
         except Exception as e:
-            logger.error(f"Retrieval failed: {e}")
-            raise
+            logger.error(f"Search failed: {e}")
+            return []
     
-    def retrieve_by_entity(
+    def vector_search(
         self,
-        entity_id: str,
-        max_results: int = 10
+        query: str,
+        limit: int = 10,
+        filters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Retrieve documents by specific entity ID
-        
-        Args:
-            entity_id: Entity identifier
-            max_results: Maximum number of results
-            
-        Returns:
-            List of documents containing the entity
-        """
-        try:
-            conn = psycopg2.connect(**self.db_config)
-            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            
-            query = """
-            SELECT 
-                bt.bridge_id,
-                bt.doc_id,
-                bt.span_text,
-                bt.span_start,
-                bt.span_end,
-                bt.entity_id,
-                bt.relation_id,
-                bt.confidence,
-                bt.source_url,
-                bt.created_at
-            FROM bridge_table bt
-            WHERE bt.entity_id = %s
-            ORDER BY bt.confidence DESC
-            LIMIT %s;
-            """
-            
-            cursor.execute(query, (entity_id, max_results))
-            results = cursor.fetchall()
-            
-            retrieved_docs = [dict(row) for row in results]
-            
-            conn.close()
-            
-            logger.info(f"Retrieved {len(retrieved_docs)} documents for entity {entity_id}")
-            return retrieved_docs
-            
-        except Exception as e:
-            logger.error(f"Entity retrieval failed: {e}")
-            raise
+        """Pure vector similarity search"""
+        return self.search(query, limit, filters, alpha=1.0)
     
-    def retrieve_by_document(
+    def keyword_search(
         self,
-        doc_id: str,
-        max_results: int = 50
+        query: str,
+        limit: int = 10,
+        filters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Retrieve all spans for a specific document
-        
-        Args:
-            doc_id: Document identifier
-            max_results: Maximum number of results
-            
-        Returns:
-            List of spans from the document
-        """
-        try:
-            conn = psycopg2.connect(**self.db_config)
-            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            
-            query = """
-            SELECT 
-                bt.bridge_id,
-                bt.doc_id,
-                bt.span_text,
-                bt.span_start,
-                bt.span_end,
-                bt.entity_id,
-                bt.relation_id,
-                bt.confidence,
-                bt.source_url,
-                bt.created_at
-            FROM bridge_table bt
-            WHERE bt.doc_id = %s
-            ORDER BY bt.span_start
-            LIMIT %s;
-            """
-            
-            cursor.execute(query, (doc_id, max_results))
-            results = cursor.fetchall()
-            
-            retrieved_docs = [dict(row) for row in results]
-            
-            conn.close()
-            
-            logger.info(f"Retrieved {len(retrieved_docs)} spans for document {doc_id}")
-            return retrieved_docs
-            
-        except Exception as e:
-            logger.error(f"Document retrieval failed: {e}")
-            raise
+        """Pure keyword (BM25) search"""
+        return self.search(query, limit, filters, alpha=0.0)
     
-    def hybrid_retrieve(
-        self,
-        query_text: str,
-        query_embedding: List[float],
-        max_results: int = 5,
-        vector_weight: float = 0.7,
-        keyword_weight: float = 0.3
-    ) -> List[Dict[str, Any]]:
-        """
-        Hybrid retrieval combining vector similarity and keyword matching
+    def get_by_id(self, fact_id: str) -> Optional[Dict[str, Any]]:
+        """Get fact by ID"""
+        try:
+            fact_collection = self.client.collections.get("Fact")
+            
+            response = fact_collection.query.fetch_objects(
+                filters=Filter.by_property("fact_id").equal(fact_id),
+                limit=1
+            )
+            
+            if response.objects:
+                obj = response.objects[0]
+                return {
+                    'fact_id': obj.properties.get('fact_id'),
+                    'indicator': obj.properties.get('indicator'),
+                    'district': obj.properties.get('district'),
+                    'year': obj.properties.get('year'),
+                    'value': obj.properties.get('value'),
+                    'unit': obj.properties.get('unit'),
+                    'source': obj.properties.get('source'),
+                    'span_text': obj.properties.get('span_text'),
+                }
+            
+            return None
         
-        Args:
-            query_text: Original query text for keyword matching
-            query_embedding: Query embedding for vector similarity
-            max_results: Maximum number of results
-            vector_weight: Weight for vector similarity score
-            keyword_weight: Weight for keyword matching score
-            
-        Returns:
-            List of documents with combined relevance scores
-        """
-        try:
-            conn = psycopg2.connect(**self.db_config)
-            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            
-            # Convert embedding to PostgreSQL vector format
-            embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
-            
-            # Extract keywords from query
-            keywords = query_text.lower().split()
-            keyword_pattern = '|'.join(keywords)
-            
-            # Hybrid query combining vector similarity and keyword matching
-            query = """
-            SELECT 
-                bt.bridge_id,
-                bt.doc_id,
-                bt.span_text,
-                bt.span_start,
-                bt.span_end,
-                bt.entity_id,
-                bt.relation_id,
-                bt.confidence,
-                bt.source_url,
-                bt.created_at,
-                (%s * (1 - (bt.embedding <=> %s::vector))) + 
-                (%s * CASE 
-                    WHEN bt.span_text ILIKE ANY(ARRAY[%s])
-                    THEN 1.0 
-                    ELSE 0.0 
-                END) as hybrid_score
-            FROM bridge_table bt
-            WHERE (1 - (bt.embedding <=> %s::vector)) > 0.5 
-               OR bt.span_text ILIKE ANY(ARRAY[%s])
-            ORDER BY hybrid_score DESC
-            LIMIT %s;
-            """
-            
-            # Create keyword patterns for ILIKE matching
-            keyword_patterns = [f'%{kw}%' for kw in keywords]
-            
-            cursor.execute(query, (
-                vector_weight, embedding_str,
-                keyword_weight, keyword_patterns,
-                embedding_str, keyword_patterns,
-                max_results
-            ))
-            
-            results = cursor.fetchall()
-            retrieved_docs = [dict(row) for row in results]
-            
-            conn.close()
-            
-            logger.info(f"Hybrid retrieval returned {len(retrieved_docs)} documents")
-            return retrieved_docs
-            
         except Exception as e:
-            logger.error(f"Hybrid retrieval failed: {e}")
-            raise
+            logger.error(f"Get by ID failed: {e}")
+            return None
     
-    def get_retrieval_stats(self) -> Dict[str, Any]:
-        """Get retrieval statistics"""
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get database statistics"""
         try:
-            conn = psycopg2.connect(**self.db_config)
-            cursor = conn.cursor()
+            fact_collection = self.client.collections.get("Fact")
+            doc_collection = self.client.collections.get("Document")
             
-            # Get total spans count
-            cursor.execute("SELECT COUNT(*) FROM bridge_table")
-            total_spans = cursor.fetchone()[0]
+            fact_count = fact_collection.aggregate.over_all(total_count=True).total_count
+            doc_count = doc_collection.aggregate.over_all(total_count=True).total_count
             
-            # Get unique documents count
-            cursor.execute("SELECT COUNT(DISTINCT doc_id) FROM bridge_table")
-            unique_docs = cursor.fetchone()[0]
+            # Get unique indicators
+            indicator_response = fact_collection.aggregate.over_all(
+                group_by="indicator"
+            )
+            unique_indicators = len(indicator_response.groups) if indicator_response.groups else 0
             
-            # Get unique entities count
-            cursor.execute("SELECT COUNT(DISTINCT entity_id) FROM bridge_table WHERE entity_id IS NOT NULL")
-            unique_entities = cursor.fetchone()[0]
-            
-            # Get average confidence
-            cursor.execute("SELECT AVG(confidence) FROM bridge_table")
-            avg_confidence = cursor.fetchone()[0] or 0
-            
-            conn.close()
+            # Get unique districts
+            district_response = fact_collection.aggregate.over_all(
+                group_by="district"
+            )
+            unique_districts = len(district_response.groups) if district_response.groups else 0
             
             return {
-                'total_spans': total_spans,
-                'unique_documents': unique_docs,
-                'unique_entities': unique_entities,
-                'average_confidence': round(avg_confidence, 3)
+                "total_facts": fact_count,
+                "total_documents": doc_count,
+                "unique_indicators": unique_indicators,
+                "unique_districts": unique_districts,
+                "database": "Weaviate"
             }
-            
+        
         except Exception as e:
-            logger.error(f"Failed to get retrieval stats: {e}")
+            logger.error(f"Get statistics failed: {e}")
             return {}
+    
+    def close(self):
+        """Close connection"""
+        self.client.close()
+
+# Backward compatibility aliases
+PolicyRetriever = WeaviateRetriever

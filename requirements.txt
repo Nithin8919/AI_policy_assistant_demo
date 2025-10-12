@@ -1,18 +1,17 @@
-# AI Policy Co-Pilot MVP Requirements
+# AI Policy Co-Pilot MVP Requirements - UPDATED FOR WEAVIATE
 # Core FastAPI and web framework
 fastapi>=0.100.0
 uvicorn>=0.23.0
-psycopg2-binary>=2.9.0
 
 # Database drivers
 neo4j>=5.0.0
 sqlalchemy>=2.0.0
 
-# Vector database and embeddings
-pgvector>=0.2.0
+# Vector database and embeddings (UPDATED FOR WEAVIATE)
+weaviate-client==4.5.1  # NEW - Replaces psycopg2-binary and pgvector
 sentence-transformers>=2.2.0
-faiss-cpu>=1.7.0
-chromadb>=0.4.0
+faiss-cpu>=1.7.0  # Optional - for local fallback
+chromadb>=0.4.0   # Optional - for experimentation
 
 # Data processing and NLP
 pandas>=2.0.0

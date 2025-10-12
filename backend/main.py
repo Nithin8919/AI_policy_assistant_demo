@@ -14,10 +14,9 @@ import sys
 project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
-from backend.retriever import PolicyRetriever
+from backend.retriever import WeaviateRetriever
 from backend.embeddings import EmbeddingService
 from backend.graph_manager import GraphManager
-from backend.bridge_table import BridgeTableManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -25,9 +24,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="AI Policy Co-Pilot API",
-    description="REST API for Andhra Pradesh Education Policy Intelligence",
-    version="1.0.0"
+    title="AP Education Policy Co-Pilot API",
+    description="RAG-based policy intelligence system with Weaviate",
+    version="2.0.0"
 )
 
 # Add CORS middleware
@@ -43,14 +42,15 @@ app.add_middleware(
 retriever = None
 embedding_service = None
 graph_manager = None
-bridge_manager = None
 
 # Pydantic models
 class QueryRequest(BaseModel):
     query: str
-    max_results: int = 5
+    limit: int = 10
     include_graph: bool = True
     include_vector: bool = True
+    filters: Optional[Dict[str, Any]] = None
+    alpha: float = 0.7  # NEW: hybrid search balance
 
 class QueryResponse(BaseModel):
     query: str
@@ -72,7 +72,7 @@ class DocumentResponse(BaseModel):
 def get_retriever():
     global retriever
     if retriever is None:
-        retriever = PolicyRetriever()
+        retriever = WeaviateRetriever()
     return retriever
 
 def get_embedding_service():
@@ -87,79 +87,56 @@ def get_graph_manager():
         graph_manager = GraphManager()
     return graph_manager
 
-def get_bridge_manager():
-    global bridge_manager
-    if bridge_manager is None:
-        bridge_manager = BridgeTableManager()
-    return bridge_manager
-
 # API Endpoints
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "AI Policy Co-Pilot API",
-        "version": "1.0.0",
-        "status": "running",
-        "endpoints": {
-            "query": "/query",
-            "documents": "/documents",
-            "health": "/health",
-            "stats": "/stats"
-        }
+        "name": "AP Education Policy Co-Pilot API",
+        "version": "2.0.0",
+        "database": "Weaviate + Neo4j",
+        "status": "operational"
     }
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     try:
-        # Check database connections
-        bridge_mgr = get_bridge_manager()
-        graph_mgr = get_graph_manager()
-        
-        bridge_status = bridge_mgr.check_connection()
-        graph_status = graph_mgr.check_connection()
+        # Test Weaviate
+        weaviate_retriever = get_retriever()
+        stats = weaviate_retriever.get_statistics()
         
         return {
             "status": "healthy",
-            "services": {
-                "bridge_table": bridge_status,
-                "knowledge_graph": graph_status,
-                "embedding_service": "healthy"
-            }
+            "database": "Weaviate",
+            "facts_count": stats.get("total_facts", 0),
+            "documents_count": stats.get("total_documents", 0)
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=503, detail=f"Service unhealthy: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
 @app.post("/query", response_model=QueryResponse)
-async def query_policies(
-    request: QueryRequest,
-    retriever: PolicyRetriever = Depends(get_retriever),
-    embedding_service: EmbeddingService = Depends(get_embedding_service),
-    graph_manager: GraphManager = Depends(get_graph_manager)
-):
-    """Query the policy knowledge base"""
-    import time
-    start_time = time.time()
-    
+async def query_policies(request: QueryRequest):
+    """Search endpoint with hybrid search"""
     try:
-        # Generate embedding for query
-        query_embedding = embedding_service.encode(request.query)
+        import time
+        start_time = time.time()
         
-        # Retrieve relevant documents
-        results = retriever.retrieve(
-            query_embedding=query_embedding,
-            max_results=request.max_results,
-            include_vector=request.include_vector
+        # Weaviate hybrid search
+        weaviate_retriever = get_retriever()
+        results = weaviate_retriever.search(
+            query=request.query,
+            limit=request.limit,
+            filters=request.filters,
+            alpha=request.alpha
         )
         
         # Get graph context if requested
         graph_context = None
         if request.include_graph and results:
-            entity_ids = [r.get('entity_id') for r in results if r.get('entity_id')]
-            if entity_ids:
-                graph_context = graph_manager.get_entity_context(entity_ids)
+            graph_mgr = get_graph_manager()
+            entity_ids = [r['fact_id'] for r in results[:5]]
+            graph_context = graph_mgr.get_entity_context(entity_ids)
         
         processing_time = time.time() - start_time
         
@@ -169,64 +146,59 @@ async def query_policies(
             graph_context=graph_context,
             processing_time=processing_time
         )
-        
+    
     except Exception as e:
-        logger.error(f"Query failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+        logger.error(f"Search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
+# Document management endpoints - TO BE IMPLEMENTED
+# These would integrate with the Weaviate pipeline
 @app.post("/documents", response_model=DocumentResponse)
-async def add_document(
-    request: DocumentRequest,
-    bridge_manager: BridgeTableManager = Depends(get_bridge_manager)
-):
+async def add_document(request: DocumentRequest):
     """Add a new document to the knowledge base"""
-    try:
-        # This would integrate with the data pipeline
-        document_id = bridge_manager.add_document(
-            document_type=request.document_type,
-            source_url=request.source_url,
-            file_path=request.file_path
-        )
-        
-        return DocumentResponse(
-            document_id=document_id,
-            status="success",
-            message="Document added successfully"
-        )
-        
-    except Exception as e:
-        logger.error(f"Document addition failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
+    # This would trigger the data pipeline to process new documents
+    raise HTTPException(status_code=501, detail="Document upload not implemented yet - use pipeline stages")
 
 @app.get("/stats")
-async def get_statistics(
-    bridge_manager: BridgeTableManager = Depends(get_bridge_manager),
-    graph_manager: GraphManager = Depends(get_graph_manager)
-):
+async def get_statistics():
     """Get system statistics"""
     try:
-        bridge_stats = bridge_manager.get_statistics()
-        graph_stats = graph_manager.get_statistics()
+        weaviate_retriever = get_retriever()
+        graph_mgr = get_graph_manager()
+        
+        weaviate_stats = weaviate_retriever.get_statistics()
+        graph_stats = graph_mgr.get_statistics()
         
         return {
-            "bridge_table": bridge_stats,
+            "weaviate": weaviate_stats,
             "knowledge_graph": graph_stats,
-            "total_documents": bridge_stats.get("total_documents", 0),
-            "total_entities": bridge_stats.get("total_entities", 0),
-            "total_relations": bridge_stats.get("total_relations", 0)
+            "total_facts": weaviate_stats.get("total_facts", 0),
+            "total_documents": weaviate_stats.get("total_documents", 0)
         }
-        
+    
     except Exception as e:
         logger.error(f"Statistics retrieval failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Statistics retrieval failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Statistics failed: {str(e)}")
 
 @app.get("/documents")
-async def list_documents(
-    bridge_manager: BridgeTableManager = Depends(get_bridge_manager)
-):
+async def list_documents():
     """List all documents in the knowledge base"""
     try:
-        documents = bridge_manager.list_documents()
+        weaviate_retriever = get_retriever()
+        client = weaviate_retriever.client
+        doc_collection = client.collections.get("Document")
+        
+        response = doc_collection.query.fetch_objects(limit=100)
+        documents = []
+        for obj in response.objects:
+            documents.append({
+                'doc_id': obj.properties.get('doc_id'),
+                'filename': obj.properties.get('filename'),
+                'source_type': obj.properties.get('source_type'),
+                'year': obj.properties.get('year'),
+                'total_pages': obj.properties.get('total_pages')
+            })
+        
         return {"documents": documents}
         
     except Exception as e:
@@ -234,17 +206,33 @@ async def list_documents(
         raise HTTPException(status_code=500, detail=f"Document listing failed: {str(e)}")
 
 @app.get("/documents/{document_id}")
-async def get_document(
-    document_id: str,
-    bridge_manager: BridgeTableManager = Depends(get_bridge_manager)
-):
+async def get_document(document_id: str):
     """Get details of a specific document"""
     try:
-        document = bridge_manager.get_document(document_id)
-        if not document:
+        weaviate_retriever = get_retriever()
+        client = weaviate_retriever.client
+        doc_collection = client.collections.get("Document")
+        
+        from weaviate.classes.query import Filter
+        response = doc_collection.query.fetch_objects(
+            filters=Filter.by_property("doc_id").equal(document_id),
+            limit=1
+        )
+        
+        if not response.objects:
             raise HTTPException(status_code=404, detail="Document not found")
         
-        return document
+        obj = response.objects[0]
+        return {
+            'doc_id': obj.properties.get('doc_id'),
+            'filename': obj.properties.get('filename'),
+            'source_type': obj.properties.get('source_type'),
+            'year': obj.properties.get('year'),
+            'total_pages': obj.properties.get('total_pages'),
+            'extraction_method': obj.properties.get('extraction_method'),
+            'file_path': obj.properties.get('file_path'),
+            'created_at': obj.properties.get('created_at')
+        }
         
     except HTTPException:
         raise
@@ -255,39 +243,27 @@ async def get_document(
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
-    """Initialize services on startup"""
-    logger.info("Starting AI Policy Co-Pilot API...")
+    """Initialize connections on startup"""
+    global retriever, graph_manager
     
-    try:
-        # Initialize services
-        global retriever, embedding_service, graph_manager, bridge_manager
-        
-        embedding_service = EmbeddingService()
-        graph_manager = GraphManager()
-        bridge_manager = BridgeTableManager()
-        retriever = PolicyRetriever()
-        
-        logger.info("All services initialized successfully")
-        
-    except Exception as e:
-        logger.error(f"Startup failed: {e}")
-        raise
+    logger.info("Initializing backend services...")
+    
+    retriever = WeaviateRetriever()
+    graph_manager = GraphManager()
+    
+    logger.info("Backend services initialized")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    logger.info("Shutting down AI Policy Co-Pilot API...")
+    global retriever, graph_manager
     
-    try:
-        if graph_manager:
-            graph_manager.close()
-        if bridge_manager:
-            bridge_manager.close()
-        
-        logger.info("Shutdown completed")
-        
-    except Exception as e:
-        logger.error(f"Shutdown error: {e}")
+    if retriever:
+        retriever.close()
+    if graph_manager:
+        graph_manager.close()
+    
+    logger.info("Backend services closed")
 
 if __name__ == "__main__":
     uvicorn.run(

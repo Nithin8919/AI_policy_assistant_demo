@@ -1,169 +1,146 @@
 #!/usr/bin/env python3
 """
-Database Setup Utility
-Sets up PostgreSQL and Neo4j databases for the pipeline
+Database Setup Utility - Weaviate + Neo4j
+Sets up Weaviate vector database and Neo4j knowledge graph
 """
 import os
 import sys
 import logging
-import subprocess
 from pathlib import Path
 from typing import Dict, Any
-import psycopg2
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+from datetime import datetime
+import subprocess
 
-# Neo4j
+import weaviate
+from weaviate.classes.config import Configure, Property, DataType
+from weaviate.classes.init import Auth
+
+# Neo4j (keep as-is)
 try:
     from neo4j import GraphDatabase
     NEO4J_AVAILABLE = True
 except ImportError:
     NEO4J_AVAILABLE = False
+    print("Warning: neo4j package not installed")
 
 logger = logging.getLogger(__name__)
 
 class DatabaseSetup:
-    """Database setup utility for AP education policy intelligence"""
+    """Setup Weaviate and Neo4j databases"""
     
     def __init__(self):
-        # Database configurations
-        self.pg_config = {
-            'host': 'localhost',
-            'port': 5432,
-            'user': 'postgres',
-            'password': 'password'
-        }
+        # Weaviate configuration
+        self.weaviate_url = os.getenv('WEAVIATE_URL', 'http://localhost:8080')
+        self.weaviate_timeout = int(os.getenv('WEAVIATE_TIMEOUT', '30'))
         
+        # Neo4j configuration (unchanged)
         self.neo4j_config = {
-            'uri': 'bolt://localhost:7687',
-            'user': 'neo4j',
-            'password': 'password'
+            'uri': os.getenv('NEO4J_URI', 'bolt://localhost:7687'),
+            'user': os.getenv('NEO4J_USER', 'neo4j'),
+            'password': os.getenv('NEO4J_PASSWORD', 'password')
         }
-        
-        # Database names
-        self.pg_database = 'ap_education_policy'
-        self.neo4j_database = 'neo4j'
     
-    def setup_postgresql(self) -> bool:
-        """Setup PostgreSQL database with pgvector extension"""
-        logger.info("Setting up PostgreSQL database...")
+    def setup_weaviate(self) -> bool:
+        """Setup Weaviate schema and collections"""
+        logger.info("Setting up Weaviate database...")
         
         try:
-            # Connect to PostgreSQL server
-            conn = psycopg2.connect(**self.pg_config)
-            conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-            cursor = conn.cursor()
+            # Connect to Weaviate
+            client = weaviate.connect_to_local(
+                host=self.weaviate_url.replace('http://', '').replace('https://', ''),
+                port=8080,
+                grpc_port=50051
+            )
             
-            # Create database
-            cursor.execute(f"CREATE DATABASE {self.pg_database};")
-            logger.info(f"Created database: {self.pg_database}")
+            logger.info("Connected to Weaviate")
             
-            cursor.close()
-            conn.close()
+            # Check if collections already exist
+            existing_collections = [c.name for c in client.collections.list_all()]
             
-            # Connect to the new database
-            db_config = self.pg_config.copy()
-            db_config['database'] = self.pg_database
+            # Create Fact collection
+            if "Fact" not in existing_collections:
+                client.collections.create(
+                    name="Fact",
+                    description="Educational policy facts with metrics and metadata",
+                    properties=[
+                        Property(name="fact_id", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="indicator", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="category", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="district", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="year", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="value", data_type=DataType.NUMBER),
+                        Property(name="unit", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="source", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="page_ref", data_type=DataType.INT),
+                        Property(name="confidence", data_type=DataType.NUMBER),
+                        Property(name="table_id", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="pdf_name", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="span_text", data_type=DataType.TEXT),  # This gets vectorized
+                        Property(name="created_at", data_type=DataType.DATE),
+                    ],
+                    vectorizer_config=Configure.Vectorizer.none(),  # We provide embeddings
+                    vector_index_config=Configure.VectorIndex.hnsw(
+                        distance_metric="cosine",
+                        ef_construction=128,
+                        ef=64,
+                        max_connections=32
+                    )
+                )
+                logger.info("Created Fact collection")
+            else:
+                logger.info("Fact collection already exists")
             
-            conn = psycopg2.connect(**db_config)
-            conn.autocommit = True
-            cursor = conn.cursor()
+            # Create Document collection
+            if "Document" not in existing_collections:
+                client.collections.create(
+                    name="Document",
+                    description="Source documents (PDFs, GOs, Reports)",
+                    properties=[
+                        Property(name="doc_id", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="filename", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="source_type", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="year", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="total_pages", data_type=DataType.INT),
+                        Property(name="extraction_method", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="checksum", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="file_path", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="created_at", data_type=DataType.DATE),
+                    ],
+                    vectorizer_config=Configure.Vectorizer.none()
+                )
+                logger.info("Created Document collection")
+            else:
+                logger.info("Document collection already exists")
             
-            # Enable pgvector extension
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-            logger.info("Enabled pgvector extension")
+            # Create Entity collection (for bridging with Neo4j)
+            if "Entity" not in existing_collections:
+                client.collections.create(
+                    name="Entity",
+                    description="Named entities extracted from documents",
+                    properties=[
+                        Property(name="entity_id", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="entity_type", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="entity_name", data_type=DataType.TEXT),
+                        Property(name="canonical_name", data_type=DataType.TEXT, skip_vectorization=True),
+                        Property(name="aliases", data_type=DataType.TEXT_ARRAY, skip_vectorization=True),
+                        Property(name="created_at", data_type=DataType.DATE),
+                    ],
+                    vectorizer_config=Configure.Vectorizer.none()
+                )
+                logger.info("Created Entity collection")
+            else:
+                logger.info("Entity collection already exists")
             
-            # Create tables
-            self._create_postgresql_tables(cursor)
-            
-            cursor.close()
-            conn.close()
-            
-            logger.info("PostgreSQL setup completed successfully")
+            client.close()
+            logger.info("Weaviate setup completed successfully")
             return True
         
         except Exception as e:
-            logger.error(f"PostgreSQL setup failed: {e}")
+            logger.error(f"Weaviate setup failed: {e}")
             return False
     
-    def _create_postgresql_tables(self, cursor):
-        """Create PostgreSQL tables"""
-        tables = {
-            'facts': """
-                CREATE TABLE IF NOT EXISTS facts (
-                    fact_id VARCHAR(50) PRIMARY KEY,
-                    indicator VARCHAR(100) NOT NULL,
-                    category VARCHAR(50),
-                    district VARCHAR(100),
-                    year VARCHAR(20),
-                    value DECIMAL(15,6),
-                    unit VARCHAR(20),
-                    source VARCHAR(50),
-                    page_ref INTEGER,
-                    confidence DECIMAL(3,2),
-                    table_id VARCHAR(50),
-                    pdf_name VARCHAR(200),
-                    span_text TEXT,
-                    embedding VECTOR(384),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """,
-            
-            'documents': """
-                CREATE TABLE IF NOT EXISTS documents (
-                    doc_id VARCHAR(50) PRIMARY KEY,
-                    filename VARCHAR(200) NOT NULL,
-                    source_type VARCHAR(50),
-                    year VARCHAR(20),
-                    total_pages INTEGER,
-                    extraction_method VARCHAR(50),
-                    checksum VARCHAR(64),
-                    file_path VARCHAR(500),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """,
-            
-            'entities': """
-                CREATE TABLE IF NOT EXISTS entities (
-                    entity_id VARCHAR(50) PRIMARY KEY,
-                    entity_type VARCHAR(50) NOT NULL,
-                    entity_name VARCHAR(200) NOT NULL,
-                    canonical_name VARCHAR(200),
-                    aliases TEXT[],
-                    metadata JSONB,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """
-        }
-        
-        for table_name, table_sql in tables.items():
-            try:
-                cursor.execute(table_sql)
-                logger.info(f"Created table: {table_name}")
-            except Exception as e:
-                logger.warning(f"Failed to create table {table_name}: {e}")
-        
-        # Create indexes
-        indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_facts_indicator ON facts(indicator);",
-            "CREATE INDEX IF NOT EXISTS idx_facts_district ON facts(district);",
-            "CREATE INDEX IF NOT EXISTS idx_facts_year ON facts(year);",
-            "CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source);",
-            "CREATE INDEX IF NOT EXISTS idx_facts_embedding ON facts USING ivfflat (embedding vector_cosine_ops);",
-            "CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_type);",
-            "CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year);",
-            "CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);",
-            "CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(entity_name);"
-        ]
-        
-        for index_sql in indexes:
-            try:
-                cursor.execute(index_sql)
-            except Exception as e:
-                logger.warning(f"Failed to create index: {e}")
-    
     def setup_neo4j(self) -> bool:
-        """Setup Neo4j database"""
+        """Setup Neo4j knowledge graph - UNCHANGED"""
         if not NEO4J_AVAILABLE:
             logger.warning("Neo4j driver not available")
             return False
@@ -171,7 +148,6 @@ class DatabaseSetup:
         logger.info("Setting up Neo4j database...")
         
         try:
-            # Connect to Neo4j
             driver = GraphDatabase.driver(
                 self.neo4j_config['uri'],
                 auth=(self.neo4j_config['user'], self.neo4j_config['password'])
@@ -209,7 +185,6 @@ class DatabaseSetup:
                         logger.warning(f"Index creation failed: {e}")
             
             driver.close()
-            
             logger.info("Neo4j setup completed successfully")
             return True
         
@@ -221,17 +196,20 @@ class DatabaseSetup:
         """Test database connections"""
         results = {}
         
-        # Test PostgreSQL
+        # Test Weaviate
         try:
-            db_config = self.pg_config.copy()
-            db_config['database'] = self.pg_database
-            conn = psycopg2.connect(**db_config)
-            conn.close()
-            results['postgresql'] = True
-            logger.info("PostgreSQL connection: OK")
+            client = weaviate.connect_to_local(
+                host=self.weaviate_url.replace('http://', '').replace('https://', ''),
+                port=8080,
+                grpc_port=50051
+            )
+            client.is_ready()
+            client.close()
+            results['weaviate'] = True
+            logger.info("Weaviate connection: OK")
         except Exception as e:
-            results['postgresql'] = False
-            logger.error(f"PostgreSQL connection failed: {e}")
+            results['weaviate'] = False
+            logger.error(f"Weaviate connection failed: {e}")
         
         # Test Neo4j
         if NEO4J_AVAILABLE:
@@ -259,7 +237,7 @@ class DatabaseSetup:
         logger.info("Installing Python dependencies...")
         
         required_packages = [
-            "psycopg2-binary",
+            "weaviate-client==4.5.1",  # NEW
             "neo4j",
             "sentence-transformers",
             "fastapi",
@@ -338,40 +316,20 @@ class DatabaseSetup:
                 "working_directory": str(Path.cwd())
             },
             "database_config": {
-                "postgresql": self.pg_config,
+                "weaviate": {"url": self.weaviate_url},
                 "neo4j": self.neo4j_config
             },
-            "connection_test": self.test_connections(),
-            "system_requirements": {
-                "tesseract": self._check_tesseract(),
-                "ghostscript": self._check_ghostscript()
-            }
+            "connection_test": self.test_connections()
         }
         
         return report
-    
-    def _check_tesseract(self) -> bool:
-        """Check if Tesseract is available"""
-        try:
-            result = subprocess.run(["tesseract", "--version"], capture_output=True, text=True)
-            return result.returncode == 0
-        except FileNotFoundError:
-            return False
-    
-    def _check_ghostscript(self) -> bool:
-        """Check if Ghostscript is available"""
-        try:
-            result = subprocess.run(["gs", "--version"], capture_output=True, text=True)
-            return result.returncode == 0
-        except FileNotFoundError:
-            return False
 
 def main():
     """Main function to run database setup"""
     import argparse
     
     parser = argparse.ArgumentParser(description='Setup databases for AP Education Policy Intelligence')
-    parser.add_argument('--postgresql-only', action='store_true', help='Setup only PostgreSQL')
+    parser.add_argument('--weaviate-only', action='store_true', help='Setup only Weaviate')
     parser.add_argument('--neo4j-only', action='store_true', help='Setup only Neo4j')
     parser.add_argument('--test-only', action='store_true', help='Only test connections')
     parser.add_argument('--install-deps', action='store_true', help='Install Python dependencies')
@@ -380,7 +338,10 @@ def main():
     args = parser.parse_args()
     
     # Setup logging
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
     
     # Initialize setup
     setup = DatabaseSetup()
@@ -389,9 +350,9 @@ def main():
         if args.test_only:
             # Only test connections
             results = setup.test_connections()
-            print("Connection Test Results:")
+            print("\nConnection Test Results:")
             for db, status in results.items():
-                print(f"  {db}: {'OK' if status else 'FAILED'}")
+                print(f"  {db}: {'✅ OK' if status else '❌ FAILED'}")
             sys.exit(0 if all(results.values()) else 1)
         
         elif args.install_deps:
@@ -409,9 +370,9 @@ def main():
             success = True
             
             if not args.neo4j_only:
-                success &= setup.setup_postgresql()
+                success &= setup.setup_weaviate()
             
-            if not args.postgresql_only:
+            if not args.weaviate_only:
                 success &= setup.setup_neo4j()
             
             if success:
@@ -424,14 +385,14 @@ def main():
                 print("\n" + "="*60)
                 print("DATABASE SETUP COMPLETED")
                 print("="*60)
-                print(f"PostgreSQL: {'OK' if results.get('postgresql', False) else 'FAILED'}")
-                print(f"Neo4j: {'OK' if results.get('neo4j', False) else 'FAILED'}")
+                print(f"Weaviate: {'✅ OK' if results.get('weaviate', False) else '❌ FAILED'}")
+                print(f"Neo4j: {'✅ OK' if results.get('neo4j', False) else '❌ FAILED'}")
                 print("="*60)
                 
                 if all(results.values()):
-                    print("All databases are ready for the pipeline!")
+                    print("\n✅ All databases are ready for the pipeline!")
                 else:
-                    print("Some databases failed. Please check the logs.")
+                    print("\n❌ Some databases failed. Please check the logs.")
                 
                 sys.exit(0 if all(results.values()) else 1)
             else:
