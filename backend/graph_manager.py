@@ -25,15 +25,20 @@ class GraphManager:
             self.driver = None
             return
             
-        self.uri = uri or os.getenv('NEO4J_URI', 'bolt://localhost:7687')
+        self.uri = uri or os.getenv('NEO4J_URI', 'neo4j://localhost:7687')
         self.auth = auth or (
             os.getenv('NEO4J_USER', 'neo4j'),
             os.getenv('NEO4J_PASSWORD', 'password')
         )
         
-        self.driver = GraphDatabase.driver(self.uri, auth=self.auth)
-        self._test_connection()
-        self._create_constraints()
+        try:
+            self.driver = GraphDatabase.driver(self.uri, auth=self.auth)
+            self._test_connection()
+            self._create_constraints()
+        except Exception as e:
+            logger.warning(f"Neo4j connection failed during initialization: {e}")
+            logger.warning("Graph operations will use demo data fallback")
+            self.driver = None
     
     def _test_connection(self):
         """Test Neo4j connection"""
@@ -453,6 +458,324 @@ class GraphManager:
             return True
         except:
             return False
+    
+    def bridge_search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Bridge table search - search facts by keyword matching on content
+        """
+        try:
+            if not NEO4J_AVAILABLE or self.driver is None:
+                logger.warning("Neo4j not available, using demo data for bridge search")
+                return self._bridge_search_demo_data(query, limit)
+            
+            with self.driver.session() as session:
+                # Search for facts that match query terms in content
+                cypher_query = """
+                MATCH (f:Fact)-[:MEASURES]->(i:Indicator)
+                OPTIONAL MATCH (f)-[:LOCATED_IN]->(d:District)
+                WHERE toLower(f.content) CONTAINS toLower($search_term)
+                   OR toLower(i.name) CONTAINS toLower($search_term)
+                   OR toLower(i.description) CONTAINS toLower($search_term)
+                RETURN f.id as fact_id, 
+                       i.name as indicator,
+                       i.category as category,
+                       d.name as district,
+                       f.year as year,
+                       f.value as value,
+                       f.unit as unit,
+                       f.content as content,
+                       f.source as source,
+                       1 as page_ref,
+                       0.8 as confidence,
+                       0.8 as score
+                ORDER BY f.year DESC
+                LIMIT $limit
+                """
+                
+                result = session.run(cypher_query, search_term=query, limit=limit)
+                
+                bridge_results = []
+                for record in result:
+                    bridge_result = {
+                        'fact_id': record['fact_id'],
+                        'indicator': record['indicator'],
+                        'category': record['category'],
+                        'district': record['district'] or 'Unknown',
+                        'year': record['year'],
+                        'value': record['value'],
+                        'unit': record['unit'],
+                        'content': record['content'],
+                        'source': record['source'],
+                        'page_ref': record['page_ref'],
+                        'confidence': record['confidence'],
+                        'score': record['score'],
+                        'method': 'bridge_search'
+                    }
+                    bridge_results.append(bridge_result)
+                
+                logger.info(f"Bridge search found {len(bridge_results)} results for: {query}")
+                return bridge_results
+                
+        except Exception as e:
+            logger.error(f"Bridge search failed: {e}, falling back to demo data")
+            return self._bridge_search_demo_data(query, limit)
+    
+    def graph_search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Knowledge graph search - search using graph relationships and traversal
+        """
+        try:
+            if not NEO4J_AVAILABLE or self.driver is None:
+                logger.warning("Neo4j not available, using demo data for graph search")
+                return self._graph_search_demo_data(query, limit)
+            
+            with self.driver.session() as session:
+                # Complex graph traversal query to find related facts through relationships
+                cypher_query = """
+                // Find direct matches first
+                MATCH (f:Fact)-[:MEASURES]->(i:Indicator)
+                OPTIONAL MATCH (f)-[:LOCATED_IN]->(d:District)
+                WHERE toLower(i.name) CONTAINS toLower($search_term)
+                   OR toLower(i.description) CONTAINS toLower($search_term)
+                   OR toLower(f.content) CONTAINS toLower($search_term)
+                RETURN DISTINCT f.id as fact_id,
+                       i.name as indicator,
+                       i.category as category,
+                       d.name as district,
+                       f.year as year,
+                       f.value as value,
+                       f.unit as unit,
+                       f.content as content,
+                       f.source as source,
+                       1 as page_ref,
+                       0.9 as confidence,
+                       0.9 as score,
+                       3 as relevance_score
+                       
+                UNION ALL
+                
+                // Find facts through policy relationships
+                MATCH (p:Policy)-[pr]->(i:Indicator)<-[:MEASURES]-(f:Fact)
+                OPTIONAL MATCH (f)-[:LOCATED_IN]->(d:District)
+                WHERE toLower(p.name) CONTAINS toLower($search_term)
+                   OR toLower(p.description) CONTAINS toLower($search_term)
+                   OR toLower(i.name) CONTAINS toLower($search_term)
+                RETURN DISTINCT f.id as fact_id,
+                       i.name as indicator,
+                       i.category as category,
+                       d.name as district,
+                       f.year as year,
+                       f.value as value,
+                       f.unit as unit,
+                       f.content as content,
+                       f.source as source,
+                       1 as page_ref,
+                       0.8 as confidence,
+                       0.6 as score,
+                       2 as relevance_score
+                
+                UNION ALL
+                
+                // Find facts through indicator relationships
+                MATCH (i1:Indicator)-[ir]-(i2:Indicator)<-[:MEASURES]-(f:Fact)
+                OPTIONAL MATCH (f)-[:LOCATED_IN]->(d:District)
+                WHERE toLower(i1.name) CONTAINS toLower($search_term)
+                   OR toLower(i1.description) CONTAINS toLower($search_term)
+                RETURN DISTINCT f.id as fact_id,
+                       i2.name as indicator,
+                       i2.category as category,
+                       d.name as district,
+                       f.year as year,
+                       f.value as value,
+                       f.unit as unit,
+                       f.content as content,
+                       f.source as source,
+                       1 as page_ref,
+                       0.7 as confidence,
+                       0.3 as score,
+                       1 as relevance_score
+                       
+                ORDER BY relevance_score DESC, year DESC
+                LIMIT $limit
+                """
+                
+                result = session.run(cypher_query, search_term=query, limit=limit)
+                
+                graph_results = []
+                for record in result:
+                    graph_result = {
+                        'fact_id': record['fact_id'],
+                        'indicator': record['indicator'],
+                        'category': record['category'],
+                        'district': record['district'] or 'Unknown',
+                        'year': record['year'],
+                        'value': record['value'],
+                        'unit': record['unit'],
+                        'content': record['content'],
+                        'source': record['source'],
+                        'page_ref': record['page_ref'],
+                        'confidence': record['confidence'],
+                        'score': record['score'],
+                        'method': 'graph_search'
+                    }
+                    graph_results.append(graph_result)
+                
+                logger.info(f"Graph search found {len(graph_results)} results for: {query}")
+                return graph_results
+                
+        except Exception as e:
+            logger.error(f"Graph search failed: {e}, falling back to demo data")
+            return self._graph_search_demo_data(query, limit)
+    
+    def _bridge_search_demo_data(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Bridge search using demo data when Neo4j is not available"""
+        try:
+            # Load demo data
+            demo_file = Path("data/demo_graph_data.json")
+            if demo_file.exists():
+                with open(demo_file, 'r') as f:
+                    demo_data = json.load(f)
+                
+                query_lower = query.lower()
+                results = []
+                
+                # Search through facts
+                for fact in demo_data.get("facts", []):
+                    content_lower = fact.get("content", "").lower()
+                    indicator_lower = fact.get("indicator", "").lower()
+                    
+                    if (query_lower in content_lower or 
+                        query_lower in indicator_lower or
+                        any(word in content_lower for word in query_lower.split())):
+                        
+                        # Find district name
+                        district_name = "Unknown"
+                        for district in demo_data.get("districts", []):
+                            if district["id"] == fact.get("district"):
+                                district_name = district["name"]
+                                break
+                        
+                        result = {
+                            'fact_id': fact['fact_id'],
+                            'indicator': fact['indicator'].replace('_', ' ').title(),
+                            'category': None,
+                            'district': district_name,
+                            'year': fact['year'],
+                            'value': fact['value'],
+                            'unit': fact['unit'],
+                            'content': fact['content'],
+                            'source': fact['source'],
+                            'page_ref': 1,
+                            'confidence': 0.9,
+                            'score': 0.9,
+                            'method': 'bridge_search_demo'
+                        }
+                        results.append(result)
+                        
+                        if len(results) >= limit:
+                            break
+                
+                logger.info(f"Bridge search (demo) found {len(results)} results for: {query}")
+                return results
+            
+        except Exception as e:
+            logger.error(f"Demo bridge search failed: {e}")
+        
+        return []
+    
+    def _graph_search_demo_data(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Graph search using demo data with relationship traversal"""
+        try:
+            demo_file = Path("data/demo_graph_data.json")
+            if demo_file.exists():
+                with open(demo_file, 'r') as f:
+                    demo_data = json.load(f)
+                
+                query_lower = query.lower()
+                results = []
+                
+                # Direct fact matches (high relevance)
+                for fact in demo_data.get("facts", []):
+                    content_lower = fact.get("content", "").lower()
+                    indicator_lower = fact.get("indicator", "").lower()
+                    
+                    if query_lower in indicator_lower or query_lower in content_lower:
+                        district_name = "Unknown"
+                        for district in demo_data.get("districts", []):
+                            if district["id"] == fact.get("district"):
+                                district_name = district["name"]
+                                break
+                        
+                        result = {
+                            'fact_id': fact['fact_id'],
+                            'indicator': fact['indicator'].replace('_', ' ').title(),
+                            'category': 'Staff',
+                            'district': district_name,
+                            'year': fact['year'], 
+                            'value': fact['value'],
+                            'unit': fact['unit'],
+                            'content': fact['content'],
+                            'source': fact['source'],
+                            'page_ref': 1,
+                            'confidence': 0.95,
+                            'score': 0.9,
+                            'method': 'graph_search_demo'
+                        }
+                        results.append(result)
+                
+                # Relationship-based matches (medium relevance)
+                for rel in demo_data.get("relationships", []):
+                    # Find indicators related to query
+                    for indicator in demo_data.get("indicators", []):
+                        if (query_lower in indicator["name"].lower() and 
+                            (rel["source"] == indicator["id"] or rel["target"] == indicator["id"])):
+                            
+                            # Find related facts
+                            related_indicator_id = rel["target"] if rel["source"] == indicator["id"] else rel["source"]
+                            
+                            for fact in demo_data.get("facts", []):
+                                if fact["indicator"] == related_indicator_id:
+                                    district_name = "Unknown"
+                                    for district in demo_data.get("districts", []):
+                                        if district["id"] == fact.get("district"):
+                                            district_name = district["name"]
+                                            break
+                                    
+                                    result = {
+                                        'fact_id': fact['fact_id'] + "_related",
+                                        'indicator': fact['indicator'].replace('_', ' ').title(),
+                                        'category': 'Related',
+                                        'district': district_name,
+                                        'year': fact['year'],
+                                        'value': fact['value'],
+                                        'unit': fact['unit'],
+                                        'content': f"Related via {rel['type']}: {fact['content']}",
+                                        'source': fact['source'],
+                                        'page_ref': 1,
+                                        'confidence': 0.7,
+                                        'score': 0.7,
+                                        'method': 'graph_search_demo'
+                                    }
+                                    results.append(result)
+                
+                # Remove duplicates and limit
+                seen_ids = set()
+                unique_results = []
+                for result in results:
+                    fact_id = result['fact_id']
+                    if fact_id not in seen_ids:
+                        seen_ids.add(fact_id)
+                        unique_results.append(result)
+                        if len(unique_results) >= limit:
+                            break
+                
+                logger.info(f"Graph search (demo) found {len(unique_results)} results for: {query}")
+                return unique_results
+            
+        except Exception as e:
+            logger.error(f"Demo graph search failed: {e}")
+        
+        return []
     
     def close(self):
         """Close the database connection"""

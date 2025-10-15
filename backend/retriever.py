@@ -15,13 +15,9 @@ class WeaviateRetriever:
     """Hybrid retriever using Weaviate"""
     
     def __init__(self):
-        # Connect to Weaviate
+        # Connect to Weaviate using HTTP API (bypass gRPC issues)
         weaviate_url = os.getenv('WEAVIATE_URL', 'http://localhost:8080')
-        self.client = weaviate.connect_to_local(
-            host=weaviate_url.replace('http://', '').replace('https://', ''),
-            port=8080,
-            grpc_port=50051
-        )
+        self.client = weaviate.Client(url=weaviate_url)
         
         # Embedding model
         model_name = os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
@@ -51,74 +47,115 @@ class WeaviateRetriever:
             alpha: Balance between vector (1.0) and keyword (0.0) search
         """
         try:
-            fact_collection = self.client.collections.get("Fact")
-            
-            # Generate query embedding
-            query_vector = self.generate_embedding(query)
-            
-            # Build filter if provided
-            filter_obj = None
+            # Build where filter
+            where_filter = None
             if filters:
-                filter_conditions = []
+                where_conditions = []
                 
                 if 'indicator' in filters:
-                    filter_conditions.append(
-                        Filter.by_property("indicator").equal(filters['indicator'])
-                    )
+                    where_conditions.append({
+                        "path": ["indicator"],
+                        "operator": "Equal",
+                        "valueText": filters['indicator']
+                    })
                 
                 if 'district' in filters:
-                    filter_conditions.append(
-                        Filter.by_property("district").equal(filters['district'])
-                    )
+                    where_conditions.append({
+                        "path": ["district"], 
+                        "operator": "Equal",
+                        "valueText": filters['district']
+                    })
                 
                 if 'year' in filters:
-                    filter_conditions.append(
-                        Filter.by_property("year").equal(filters['year'])
-                    )
+                    where_conditions.append({
+                        "path": ["year"],
+                        "operator": "Equal", 
+                        "valueInt": int(filters['year'])
+                    })
                 
-                if 'category' in filters:
-                    filter_conditions.append(
-                        Filter.by_property("category").equal(filters['category'])
-                    )
-                
-                # Combine filters with AND
-                if filter_conditions:
-                    filter_obj = filter_conditions[0]
-                    for condition in filter_conditions[1:]:
-                        filter_obj = filter_obj & condition
+                # Combine conditions with AND
+                if len(where_conditions) == 1:
+                    where_filter = where_conditions[0]
+                elif len(where_conditions) > 1:
+                    where_filter = {
+                        "operator": "And",
+                        "operands": where_conditions
+                    }
             
-            # Hybrid search
-            response = fact_collection.query.hybrid(
-                query=query,
-                vector=query_vector,
-                alpha=alpha,
-                limit=limit,
-                filters=filter_obj,
-                return_metadata=MetadataQuery(distance=True, score=True)
-            )
+            # Determine search method based on alpha
+            if alpha >= 0.9:
+                # Pure vector search
+                query_vector = self.generate_embedding(query)
+                query_builder = (
+                    self.client.query
+                    .get("Fact", [
+                        "fact_id", "indicator", "category", "district", "year", 
+                        "value", "unit", "content", "source_document", "source_page", 
+                        "confidence_score", "metadata"
+                    ])
+                    .with_near_vector({
+                        "vector": query_vector
+                    })
+                )
+            elif alpha <= 0.1:
+                # Pure keyword search with case-insensitive matching
+                query_builder = (
+                    self.client.query
+                    .get("Fact", [
+                        "fact_id", "indicator", "category", "district", "year", 
+                        "value", "unit", "content", "source_document", "source_page", 
+                        "confidence_score", "metadata"
+                    ])
+                    .with_bm25(query=query)
+                )
+            else:
+                # True hybrid search combining vector + BM25
+                query_vector = self.generate_embedding(query)
+                query_builder = (
+                    self.client.query
+                    .get("Fact", [
+                        "fact_id", "indicator", "category", "district", "year", 
+                        "value", "unit", "content", "source_document", "source_page", 
+                        "confidence_score", "metadata"
+                    ])
+                    .with_hybrid(
+                        query=query,
+                        vector=query_vector,
+                        alpha=alpha  # Weaviate's hybrid search with alpha parameter
+                    )
+                )
+            
+            # Add filters if provided
+            if where_filter:
+                query_builder = query_builder.with_where(where_filter)
+            
+            response = query_builder.with_additional(["score", "distance"]).with_limit(limit).do()
             
             # Format results
             results = []
-            for obj in response.objects:
-                result = {
-                    'fact_id': obj.properties.get('fact_id'),
-                    'indicator': obj.properties.get('indicator'),
-                    'category': obj.properties.get('category'),
-                    'district': obj.properties.get('district'),
-                    'year': obj.properties.get('year'),
-                    'value': obj.properties.get('value'),
-                    'unit': obj.properties.get('unit'),
-                    'source': obj.properties.get('source'),
-                    'page_ref': obj.properties.get('page_ref'),
-                    'confidence': obj.properties.get('confidence'),
-                    'span_text': obj.properties.get('span_text'),
-                    'pdf_name': obj.properties.get('pdf_name'),
-                    'score': obj.metadata.score if obj.metadata else None,
-                    'distance': obj.metadata.distance if obj.metadata else None
-                }
-                results.append(result)
+            if "data" in response and "Get" in response["data"] and "Fact" in response["data"]["Get"]:
+                for obj in response["data"]["Get"]["Fact"]:
+                    additional = obj.get("_additional", {})
+                    result = {
+                        'fact_id': obj.get('fact_id'),
+                        'indicator': obj.get('indicator'), 
+                        'category': obj.get('category'),
+                        'district': obj.get('district'),
+                        'year': obj.get('year'),
+                        'value': obj.get('value'),
+                        'unit': obj.get('unit'),
+                        'content': obj.get('content'),
+                        'source': obj.get('source_document'),
+                        'page_ref': obj.get('source_page'),
+                        'confidence': obj.get('confidence_score'),
+                        'span_text': obj.get('content'),  # Use content as span_text
+                        'pdf_name': obj.get('source_document'),
+                        'score': additional.get('score'),
+                        'distance': additional.get('distance')
+                    }
+                    results.append(result)
             
-            logger.info(f"Found {len(results)} results for query: {query}")
+            logger.info(f"Found {len(results)} results for query: {query} (alpha={alpha})")
             return results
         
         except Exception as e:
@@ -146,24 +183,35 @@ class WeaviateRetriever:
     def get_by_id(self, fact_id: str) -> Optional[Dict[str, Any]]:
         """Get fact by ID"""
         try:
-            fact_collection = self.client.collections.get("Fact")
-            
-            response = fact_collection.query.fetch_objects(
-                filters=Filter.by_property("fact_id").equal(fact_id),
-                limit=1
+            response = (
+                self.client.query
+                .get("Fact", [
+                    "fact_id", "indicator", "district", "year", 
+                    "value", "unit", "content", "source_document"
+                ])
+                .with_where({
+                    "path": ["fact_id"],
+                    "operator": "Equal",
+                    "valueText": fact_id
+                })
+                .with_limit(1)
+                .do()
             )
             
-            if response.objects:
-                obj = response.objects[0]
+            if ("data" in response and "Get" in response["data"] 
+                and "Fact" in response["data"]["Get"] 
+                and len(response["data"]["Get"]["Fact"]) > 0):
+                
+                obj = response["data"]["Get"]["Fact"][0]
                 return {
-                    'fact_id': obj.properties.get('fact_id'),
-                    'indicator': obj.properties.get('indicator'),
-                    'district': obj.properties.get('district'),
-                    'year': obj.properties.get('year'),
-                    'value': obj.properties.get('value'),
-                    'unit': obj.properties.get('unit'),
-                    'source': obj.properties.get('source'),
-                    'span_text': obj.properties.get('span_text'),
+                    'fact_id': obj.get('fact_id'),
+                    'indicator': obj.get('indicator'), 
+                    'district': obj.get('district'),
+                    'year': obj.get('year'),
+                    'value': obj.get('value'),
+                    'unit': obj.get('unit'),
+                    'source': obj.get('source'),
+                    'span_text': obj.get('span_text'),
                 }
             
             return None
@@ -175,29 +223,55 @@ class WeaviateRetriever:
     def get_statistics(self) -> Dict[str, Any]:
         """Get database statistics"""
         try:
-            fact_collection = self.client.collections.get("Fact")
-            doc_collection = self.client.collections.get("Document")
+            # Get fact count using aggregation
+            fact_response = (
+                self.client.query
+                .aggregate("Fact")
+                .with_meta_count()
+                .do()
+            )
             
-            fact_count = fact_collection.aggregate.over_all(total_count=True).total_count
-            doc_count = doc_collection.aggregate.over_all(total_count=True).total_count
+            fact_count = 0
+            if ("data" in fact_response and "Aggregate" in fact_response["data"] 
+                and "Fact" in fact_response["data"]["Aggregate"]
+                and len(fact_response["data"]["Aggregate"]["Fact"]) > 0):
+                fact_count = fact_response["data"]["Aggregate"]["Fact"][0]["meta"]["count"]
             
             # Get unique indicators
-            indicator_response = fact_collection.aggregate.over_all(
-                group_by="indicator"
+            indicator_response = (
+                self.client.query
+                .get("Fact", ["indicator"])
+                .with_limit(1000)  # Get a sample to count unique values
+                .do()
             )
-            unique_indicators = len(indicator_response.groups) if indicator_response.groups else 0
             
-            # Get unique districts
-            district_response = fact_collection.aggregate.over_all(
-                group_by="district"
+            unique_indicators = set()
+            if ("data" in indicator_response and "Get" in indicator_response["data"]
+                and "Fact" in indicator_response["data"]["Get"]):
+                for fact in indicator_response["data"]["Get"]["Fact"]:
+                    if fact.get("indicator"):
+                        unique_indicators.add(fact["indicator"])
+            
+            # Get unique districts  
+            district_response = (
+                self.client.query
+                .get("Fact", ["district"])
+                .with_limit(1000)
+                .do()
             )
-            unique_districts = len(district_response.groups) if district_response.groups else 0
+            
+            unique_districts = set()
+            if ("data" in district_response and "Get" in district_response["data"]
+                and "Fact" in district_response["data"]["Get"]):
+                for fact in district_response["data"]["Get"]["Fact"]:
+                    if fact.get("district"):
+                        unique_districts.add(fact["district"])
             
             return {
                 "total_facts": fact_count,
-                "total_documents": doc_count,
-                "unique_indicators": unique_indicators,
-                "unique_districts": unique_districts,
+                "total_documents": 0,  # Will implement later
+                "unique_indicators": len(unique_indicators),
+                "unique_districts": len(unique_districts),
                 "database": "Weaviate"
             }
         
@@ -206,8 +280,8 @@ class WeaviateRetriever:
             return {}
     
     def close(self):
-        """Close connection"""
-        self.client.close()
+        """Close connection (v3 client doesn't need explicit close)"""
+        pass
 
 # Backward compatibility aliases
 PolicyRetriever = WeaviateRetriever
